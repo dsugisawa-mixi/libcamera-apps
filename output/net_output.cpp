@@ -29,7 +29,12 @@ NetOutput::NetOutput(VideoOptions const *options) : Output(options)
 		fd_ = socket(AF_INET, SOCK_DGRAM, 0);
 		if (fd_ < 0)
 			throw std::runtime_error("unable to open udp socket");
-
+		if (options->verbose)
+			std::cerr << "Connecting to udp - server..." << std::endl;
+		if (connect(fd_, (struct sockaddr *)&saddr_, sizeof(sockaddr_in)) < 0)
+			throw std::runtime_error("connect to udp - server failed");
+		if (options->verbose)
+			std::cerr << "Connected" << std::endl;
 		saddr_ptr_ = (const sockaddr *)&saddr_; // sendto needs these for udp
 		sockaddr_in_size_ = sizeof(sockaddr_in);
 	}
@@ -92,6 +97,7 @@ NetOutput::NetOutput(VideoOptions const *options) : Output(options)
 	}
 	else
 		throw std::runtime_error("unrecognised network protocol " + options->output);
+	mtu_buffer_.resize(MTU_SIZE + HEADER_SIZE);
 }
 
 NetOutput::~NetOutput()
@@ -99,20 +105,84 @@ NetOutput::~NetOutput()
 	close(fd_);
 }
 
-// Maximum size that sendto will accept.
-constexpr size_t MAX_UDP_SIZE = 65507;
+#ifndef MIN
+#define MIN(a,b) (a<b?a:b)
+#endif
+
+int NetOutput::sendAll(int fd, void* data, int len)
+{
+	int	ret = 0L;
+	int allsend = 0L;
+	int sendlen = 0L;
+	int errored = 0;
+	int retrycnt = 0L;
+	char* senddata = (char*)data;
+	fd_set sendfd;
+	struct timeval timeout;
+	//
+	while(1) {
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 100000;
+		FD_ZERO(&sendfd);
+		FD_SET(fd, &sendfd);
+		ret = select(fd + 1, NULL, &sendfd, NULL, &timeout);
+		//retry count is over.
+		if (retrycnt ++ > 10) {
+			errored = 1;
+			break;
+		}
+		if (ret == -1) {
+			if (errno == EINTR){ continue; }
+			errored = 1;
+			break;
+		} else if(ret > 0) {
+			if(FD_ISSET(fd, &sendfd)) {
+				sendlen = send(fd, (senddata + allsend), (len - allsend), 0);
+				if (sendlen < 0) {
+					errored = 1;
+					break;
+				}
+				allsend += sendlen;
+				if (allsend >= len){ break; }
+			}
+		} else {
+			continue;
+		}
+	}
+	return(errored == 0?allsend:-1);
+}
 
 void NetOutput::outputBuffer(void *mem, size_t size, int64_t /*timestamp_us*/, uint32_t /*flags*/)
 {
 	if (options_->verbose)
 		std::cerr << "NetOutput: output buffer " << mem << " size " << size << "\n";
-	size_t max_size = saddr_ptr_ ? MAX_UDP_SIZE : size;
-	for (uint8_t *ptr = (uint8_t *)mem; size;)
-	{
-		size_t bytes_to_send = std::min(size, max_size);
-		if (sendto(fd_, ptr, bytes_to_send, 0, saddr_ptr_, sockaddr_in_size_) < 0)
+	static unsigned seqnumber = 0;
+	const unsigned PKTSIZE = MTU_SIZE;
+	unsigned bytes_written = 0;
+	unsigned header[4] = {0};
+	int splitted = (int)(size / PKTSIZE) + ((size % PKTSIZE)==0?0:1);
+	//
+	for(int n = 0; n < splitted; n++) {
+		seqnumber ++;
+		int trgtlen = MIN(PKTSIZE, size - bytes_written);
+		if ((n+1) == splitted) {
+			header[2] = htonl(1<<31 | seqnumber);
+		} else {
+			header[2] = htonl(seqnumber);
+		}
+		header[0] = htonl(0xdeadbeaf);
+		header[1] = htonl(((int)(getenv("PLAYERIDX")==NULL?1:atoi(getenv("PLAYERIDX")))));
+		header[3] = htonl(trgtlen);
+		memcpy(mtu_buffer_.data(), header, sizeof(header));
+		memcpy(mtu_buffer_.data() + sizeof(header), (char*)mem + bytes_written, trgtlen);
+
+		auto sended = sendAll(fd_, mtu_buffer_.data(), trgtlen + sizeof(header));
+		if (sended < 0)
 			throw std::runtime_error("failed to send data on socket");
-		ptr += bytes_to_send;
-		size -= bytes_to_send;
+		if (sended != (int)(trgtlen + sizeof(header))) {
+			printf("could not sendto\n");
+			break;
+		}
+		bytes_written += trgtlen;
 	}
 }
